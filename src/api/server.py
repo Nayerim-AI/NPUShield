@@ -33,6 +33,8 @@ from src.core.router import ProductionRouter, InferenceResult
 from src.core.persona_router import PersonaRouter
 from src.core.kb_loader import load_kb
 from src.core.kb_index import KBIndex
+from src.core.tool_registry import ToolRegistry, Tool
+from src.core.tool_executor import ToolExecutor, ToolTarget, ToolResult
 
 logger = logging.getLogger("npushield")
 logger.setLevel(logging.INFO)
@@ -159,11 +161,28 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 0.95
 
 
+class ToolRunRequest(BaseModel):
+    tool: str
+    target: str = "local"
+    service: Optional[str] = None
+
+
+class ToolRunResponse(BaseModel):
+    tool: str
+    target: str
+    exit_code: int
+    stdout: str
+    stderr: str
+    truncated: bool = False
+
+
 # ── Global router ─────────────────────────────────────────────────────────
 
 router: ProductionRouter | None = None
 persona_router = PersonaRouter()
 kb_index: KBIndex | None = None
+tool_registry = ToolRegistry.default()
+tool_executor = ToolExecutor()
 
 
 @asynccontextmanager
@@ -223,6 +242,22 @@ async def lifespan(app: FastAPI):
         primary.recycle()
 
 
+def _resolve_tool_target(target_name: str) -> ToolTarget:
+    """Resolve a safe tool target from environment configuration."""
+    if target_name == "local":
+        return ToolTarget.local()
+
+    # Optional SSH targets, example:
+    # NPUSHIELD_TOOL_TARGET_GATEWAY=user@10.0.0.2
+    env_name = f"NPUSHIELD_TOOL_TARGET_{target_name.upper().replace('-', '_')}"
+    raw = os.getenv(env_name, "")
+    if raw and "@" in raw:
+        user, host = raw.split("@", 1)
+        return ToolTarget.ssh(name=target_name, user=user, host=host)
+
+    raise HTTPException(404, f"Unknown or unconfigured tool target: {target_name}")
+
+
 app = FastAPI(
     title="NPUShield",
     version="0.1.0",
@@ -280,6 +315,93 @@ async def list_models():
     }
 
 
+def _maybe_run_tool_for_chat(messages: list[Message]) -> dict | None:
+    """Auto-run a safe allowlisted tool when chat intent clearly matches."""
+    last_user = ""
+    for m in reversed(messages):
+        if m.role == "user":
+            last_user = m.content
+            break
+    if not last_user:
+        return None
+
+    # Only infra persona should auto-run tools.
+    decision = persona_router.route(last_user)
+    if decision.persona != "infra":
+        return None
+
+    tool = tool_registry.match_intent(last_user)
+    if tool is None or not tool.safe or tool.requires_confirmation:
+        return None
+
+    target = ToolTarget.local()
+    result = tool_executor.run_commands(tool.commands, target=target)
+    tool_output = (
+        f"Tool executed: {tool.name}\n"
+        f"Target: {result.target_name}\n"
+        f"Exit code: {result.exit_code}\n"
+        f"STDOUT:\n{result.stdout}\n"
+        f"STDERR:\n{result.stderr}\n"
+    )
+    summary = _summarize_tool_result(tool.name, result)
+    meta = {
+        "x-tool": tool.name,
+        "x-tool-target": result.target_name,
+        "x-tool-exit-code": result.exit_code,
+    }
+    return {
+        "skip_llm": True,
+        "response": _build_tool_response(summary, MODEL_ID, meta),
+        "message": {
+            "role": "system",
+            "content": (
+                "A safe allowlisted infrastructure tool was executed. "
+                "Summarize the tool output in a concise operational status. "
+                "Do not invent facts not present in the output.\n\n"
+                f"{tool_output}"
+            ),
+        },
+        "meta": meta,
+    }
+
+
+@app.get("/v1/tools")
+async def list_tools():
+    return {
+        "object": "list",
+        "data": [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "safe": tool.safe,
+                "requires_confirmation": tool.requires_confirmation,
+                "targets": tool.targets,
+            }
+            for tool in tool_registry._tools.values()
+        ],
+    }
+
+
+@app.post("/v1/tools/run")
+async def run_tool(request: ToolRunRequest):
+    tool = tool_registry.get(request.tool)
+    if tool is None:
+        raise HTTPException(404, f"Unknown tool: {request.tool}")
+    if tool.requires_confirmation:
+        raise HTTPException(409, f"Tool requires explicit confirmation: {request.tool}")
+
+    target = _resolve_tool_target(request.target)
+    result = tool_executor.run_commands(tool.commands, target=target)
+    return ToolRunResponse(
+        tool=tool.name,
+        target=target.name,
+        exit_code=result.exit_code,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        truncated="...[truncated]" in result.stdout or "...[truncated]" in result.stderr,
+    )
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
     if router is None:
@@ -291,7 +413,15 @@ async def chat_completions(request: ChatCompletionRequest):
             media_type="text/event-stream",
         )
 
+    tool_ctx = _maybe_run_tool_for_chat(request.messages)
+    if tool_ctx and tool_ctx["skip_llm"]:
+        return tool_ctx["response"]
+
     messages, persona_meta = _augment_messages_with_rag(request.messages)
+    if tool_ctx:
+        messages.insert(0, tool_ctx["message"])
+        persona_meta.update(tool_ctx["meta"])
+
     result = router.run(
         messages=messages,
         max_tokens=request.max_tokens,
@@ -330,6 +460,54 @@ async def _stream_chat(request: ChatCompletionRequest) -> AsyncGenerator[str, No
         yield "data: [DONE]\n\n"
 
 
+def _summarize_tool_result(tool_name: str, result: ToolResult) -> str:
+    if result.exit_code != 0:
+        return (
+            f"Tool `{tool_name}` failed on `{result.target_name}` with exit code {result.exit_code}.\n\n"
+            f"STDERR:\n{result.stderr.strip() or '(empty)'}"
+        )
+    if tool_name == "server_status_top":
+        lines = result.stdout.splitlines()
+        keep = []
+        for line in lines:
+            low = line.lower()
+            if (
+                "load average" in low
+                or low.startswith("mem:")
+                or low.startswith("swap:")
+                or low.startswith("/dev/")
+                or low.startswith("tasks:")
+                or "cpu(s)" in low
+            ):
+                keep.append(line)
+        details = "\n".join(keep[:12]) or result.stdout[:1200]
+        return f"Server status tool ran successfully on `{result.target_name}`.\n\n```text\n{details}\n```"
+    return f"Tool `{tool_name}` ran successfully on `{result.target_name}`.\n\n```text\n{result.stdout[:2000]}\n```"
+
+
+def _build_tool_response(content: str, model_id: str, meta: dict) -> dict:
+    return {
+        "id": f"chatcmpl-{int(time.time())}",
+        "object": "chat.completion",
+        "created": int(datetime.now().timestamp()),
+        "model": model_id,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "tool"}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "x-provider": "tool-executor",
+        "x-duration-sec": 0,
+        "x-tokens-per-sec": 0,
+        "x-quality-error": None,
+        "x-persona": "infra",
+        "x-persona-confidence": 1.0,
+        "x-rag-docs": 0,
+        "x-rag-paths": [],
+        "x-safety-flags": [],
+        "x-tool": meta.get("x-tool"),
+        "x-tool-target": meta.get("x-tool-target"),
+        "x-tool-exit-code": meta.get("x-tool-exit-code"),
+    }
+
+
 def _build_response(result: InferenceResult, model_id: str, persona_meta: dict | None = None) -> dict:
     persona_meta = persona_meta or {}
     return {
@@ -361,6 +539,9 @@ def _build_response(result: InferenceResult, model_id: str, persona_meta: dict |
         "x-rag-docs": persona_meta.get("rag_docs", 0),
         "x-rag-paths": persona_meta.get("rag_paths", []),
         "x-safety-flags": persona_meta.get("safety_flags", []),
+        "x-tool": persona_meta.get("x-tool"),
+        "x-tool-target": persona_meta.get("x-tool-target"),
+        "x-tool-exit-code": persona_meta.get("x-tool-exit-code"),
     }
 
 
