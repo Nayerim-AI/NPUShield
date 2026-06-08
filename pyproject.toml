@@ -1,0 +1,18 @@
+[project]
+name = "npushield"
+version = "0.1.0"
+description = "Production layer for RKLLM on RK3588 NPU"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.109",
+  "uvicorn[standard]>=0.27",
+  "pydantic>=2.5",
+  "pexpect>=4.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

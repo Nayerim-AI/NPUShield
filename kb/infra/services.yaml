@@ -1,0 +1,26 @@
+reverse_proxy:
+  public_url: https://example.com
+  frontend_gateway: public-gateway
+  backend_server: nat-backend
+  backend_url: http://100.x.x.x:3000
+  routing: DNS provider -> public gateway -> VPN/private backend
+  notes:
+    - Use placeholders in public KB files.
+    - Keep real domains and IP addresses in private deployment overlays.
+
+npu_inference_api:
+  public_url: https://npu-api.example.com
+  backend_server: example-server
+  backend_url: http://127.0.0.1:18999
+  service_type: fastapi
+  notes:
+    - Exposes OpenAI-compatible chat completions.
+    - Should be protected behind an API gateway or private network for production.
+
+local_git:
+  public_url: https://git.example.com
+  backend_server: example-server
+  service_type: gitea
+  notes:
+    - Store repository URLs as examples only.
+    - Do not publish internal hostnames or private network topology.

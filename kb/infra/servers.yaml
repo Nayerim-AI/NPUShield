@@ -1,0 +1,37 @@
+example-server:
+  hostname: example-server
+  tailscale_ip: 100.x.x.x
+  os: Linux 6.x ARM64
+  role: main compute, NPU workloads, local services
+  services:
+    - gitea
+    - local-api
+    - monitoring
+
+public-gateway:
+  hostname: public-gateway
+  tailscale_ip: 100.x.x.x
+  public_ip: x.x.x.x
+  os: Ubuntu 24.04 ARM64
+  role: public gateway with reverse proxy or load balancer
+  services:
+    - traefik
+    - nginx
+    - pangolin
+    - uptime-monitor
+
+nat-backend:
+  hostname: nat-backend
+  tailscale_ip: 100.x.x.x
+  os: Debian 12 ARM64
+  role: private backend services behind NAT or VPN
+  services:
+    - dokploy
+    - dashboard
+    - internal-api
+
+notes:
+  - This file is an example inventory.
+  - Replace placeholder IPs, hostnames, and services with private deployment data.
+  - Do not commit public IPs, tokens, passwords, or customer-specific hostnames to public repositories.
+  - Store secrets outside the knowledge base.

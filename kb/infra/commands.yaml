@@ -1,0 +1,55 @@
+safe_commands:
+  check_disk:
+    description: Check root disk usage on a Linux server
+    command: "ssh user@server 'df -h /'"
+    destructive: false
+  check_memory:
+    description: Check memory usage on a Linux server
+    command: "ssh user@server 'free -h'"
+    destructive: false
+  check_docker_containers:
+    description: List running Docker containers
+    command: "ssh user@server 'docker ps --format \"table {{.Names}}\\t{{.Status}}\\t{{.Ports}}\"'"
+    destructive: false
+  check_http_endpoint:
+    description: Check whether an HTTP service responds
+    command: "curl -sS -I --max-time 15 https://example.com | head -12"
+    destructive: false
+
+requires_confirmation:
+  restart_service:
+    description: Restart a known Docker service
+    command: "ssh user@server 'docker restart service-name'"
+    destructive: true
+  reboot_server:
+    description: Reboot a Linux server
+    command: "ssh user@server 'sudo reboot'"
+    destructive: true
+
+dangerous_patterns:
+  - "rm -rf"
+  - "docker volume rm"
+  - "docker system prune"
+  - "reboot"
+  - "shutdown"
+  - "poweroff"
+  - "drop database"
+  - "truncate"
+  - "mkfs"
+  - "dd if="
+
+secret_patterns:
+  - "token"
+  - "password"
+  - "passwd"
+  - "secret"
+  - "api key"
+  - "private key"
+  - "cloudflare"
+  - "credential"
+
+policy:
+  - Only suggest commands found in this file or in private deployment overlays.
+  - Ask for explicit confirmation before destructive commands.
+  - Redact secrets and credentials.
+  - Do not include real public IP addresses or customer domains in public KB files.
