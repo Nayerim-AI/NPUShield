@@ -315,6 +315,17 @@ async def list_models():
     }
 
 
+def _is_explain_query(text: str) -> bool:
+    """Detect if user asks for explanation (should use LLM, not skip it)."""
+    lowered = text.lower()
+    explain_signals = [
+        "jelaskan", "explain", "describe", "what is", "apa itu",
+        "bagaimana", "how to", "how does", "how do",
+        "apa saja", "what are", "what services",
+    ]
+    return any(s in lowered for s in explain_signals)
+
+
 def _maybe_run_tool_for_chat(messages: list[Message]) -> dict | None:
     """Auto-run a safe allowlisted tool when chat intent clearly matches."""
     last_user = ""
@@ -349,18 +360,37 @@ def _maybe_run_tool_for_chat(messages: list[Message]) -> dict | None:
         "x-tool-target": result.target_name,
         "x-tool-exit-code": result.exit_code,
     }
+
+    # If user asks for explanation, run LLM with tool output as context
+    skip_llm = not _is_explain_query(last_user)
+
+    if skip_llm:
+        return {
+            "skip_llm": True,
+            "response": _build_tool_response(summary, MODEL_ID, meta),
+            "message": {
+                "role": "system",
+                "content": (
+                    "A safe allowlisted infrastructure tool was executed. "
+                    "Summarize the tool output in a concise operational status. "
+                    "Do not invent facts not present in the output.\n\n"
+                    f"{tool_output}"
+                ),
+            },
+            "meta": meta,
+        }
+
+    # Explain query: pass tool output to LLM for explanation
+    explain_msg = (
+        "An allowlisted infrastructure tool was executed. "
+        "The user asked for an explanation of what they see. "
+        "Use the tool output below to explain each item clearly.\n\n"
+        f"Tool: {tool.name}\nTarget: {result.target_name}\n\n"
+        f"Raw output:\n{result.stdout}"
+    )
     return {
-        "skip_llm": True,
-        "response": _build_tool_response(summary, MODEL_ID, meta),
-        "message": {
-            "role": "system",
-            "content": (
-                "A safe allowlisted infrastructure tool was executed. "
-                "Summarize the tool output in a concise operational status. "
-                "Do not invent facts not present in the output.\n\n"
-                f"{tool_output}"
-            ),
-        },
+        "skip_llm": False,
+        "message": {"role": "system", "content": explain_msg},
         "meta": meta,
     }
 

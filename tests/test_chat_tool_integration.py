@@ -47,3 +47,14 @@ def test_restart_requires_confirmation_via_tool():
     assert tool is not None
     assert tool.requires_confirmation is True
     assert tool.safe is False
+def test_explain_query_should_not_skip_llm():
+    """'jelaskan container' should keep skip_llm=False (pass output to LLM)."""
+    from src.api.server import _is_explain_query
+
+    assert _is_explain_query("jelaskan container apa aja itu") is True
+    assert _is_explain_query("explain what containers are running") is True
+    assert _is_explain_query("check top status server") is False
+    assert _is_explain_query("apa itu rkllm_init") is True
+    assert _is_explain_query("list docker containers") is False
+    assert _is_explain_query("how to restart docker") is True
+    assert _is_explain_query("show running containers") is False
