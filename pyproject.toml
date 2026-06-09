@@ -1,3 +1,11 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*"]
+
 [project]
 name = "npushield"
 version = "0.1.0"
@@ -8,7 +16,11 @@ dependencies = [
   "uvicorn[standard]>=0.27",
   "pydantic>=2.5",
   "pexpect>=4.9",
+  "prompt-toolkit>=3.0",
 ]
+
+[project.scripts]
+npushield-chat = "src.ui.chat_tui:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
