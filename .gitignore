@@ -1,20 +1,16 @@
 # Python
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
-
-# Virtual env
+*.pyc
 .venv/
-venv/
+.pytest_cache/
 
 # IDE
 .vscode/
 .idea/
 
-# Runtime DB
+# Project runtime
 kb/.kb_cache.db
+kb/.kb_cache.db-journal
 kb/.kb_index.json
 
 # Private deployment overlays / secrets
@@ -22,14 +18,5 @@ kb/overlays/
 *.private.yaml
 *.secrets.yaml
 
-# Logs
-*.log
-/tmp/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Config secrets (if any)
-.env
-*.ini
+# Egg info
+*.egg-info/
