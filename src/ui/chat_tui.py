@@ -13,6 +13,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 API_BASE = os.getenv("NPUSHIELD_HOST", "http://127.0.0.1:18999")
+API_KEY = os.getenv("NPUSHIELD_API_KEY", "").strip() or None
 DEFAULT_MODEL = "rkllm-qwen2.5-1.5b"
 
 try:
@@ -63,7 +64,10 @@ def bold(t: str) -> str:
 def _api_post(path: str, body: dict) -> dict | None:
     url = f"{API_BASE}{path}"
     data = json.dumps(body).encode()
-    req = Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+    req = Request(url, data=data, headers=headers, method="POST")
     try:
         with urlopen(req, timeout=180) as resp:
             return json.loads(resp.read())
@@ -75,8 +79,12 @@ def _api_post(path: str, body: dict) -> dict | None:
 
 def _api_get(path: str) -> dict | None:
     url = f"{API_BASE}{path}"
+    headers = {}
+    if API_KEY:
+        headers["X-API-Key"] = API_KEY
+    req = Request(url, headers=headers, method="GET")
     try:
-        with urlopen(url, timeout=10) as resp:
+        with urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
     except Exception as e:
         return {"_error": str(e)}

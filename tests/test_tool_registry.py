@@ -44,3 +44,15 @@ def test_restart_service_requires_confirmation():
     assert tool is not None
     assert tool.safe is False
     assert tool.requires_confirmation is True
+
+
+def test_build_restart_command_allowlisted():
+    registry = ToolRegistry.default()
+    cmds = registry.build_restart_command("traefik")
+    assert cmds == ["docker restart traefik"]
+
+
+def test_build_restart_command_rejected():
+    registry = ToolRegistry.default()
+    cmds = registry.build_restart_command("malicious-service")
+    assert cmds is None

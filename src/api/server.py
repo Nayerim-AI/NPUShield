@@ -23,7 +23,7 @@ from datetime import datetime
 from typing import AsyncGenerator, List, Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -35,6 +35,8 @@ from src.core.kb_loader import load_kb
 from src.core.kb_index import KBIndex
 from src.core.tool_registry import ToolRegistry, Tool
 from src.core.tool_executor import ToolExecutor, ToolTarget, ToolResult
+from src.core.auth import require_api_key
+from src.metrics.collector import metrics
 
 logger = logging.getLogger("npushield")
 logger.setLevel(logging.INFO)
@@ -267,8 +269,16 @@ app = FastAPI(
 
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus-compatible metrics endpoint. No auth required for scraping."""
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse(metrics.render_prometheus(), media_type="text/plain; version=0.0.4")
+
+
 @app.get("/health")
 async def health():
+    metrics.record_request("/health", 200)
     if router is None or not router.primary or not router.primary.is_available():
         return JSONResponse(
             status_code=503,
@@ -284,7 +294,7 @@ async def health():
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(_auth: None = Depends(require_api_key)):
     fallback_models = []
     if router and router.fallback and router.fallback.is_available():
         fallback_models = [
@@ -396,7 +406,7 @@ def _maybe_run_tool_for_chat(messages: list[Message]) -> dict | None:
 
 
 @app.get("/v1/tools")
-async def list_tools():
+async def list_tools(_auth: None = Depends(require_api_key)):
     return {
         "object": "list",
         "data": [
@@ -413,15 +423,40 @@ async def list_tools():
 
 
 @app.post("/v1/tools/run")
-async def run_tool(request: ToolRunRequest):
+async def run_tool(request: ToolRunRequest, _auth: None = Depends(require_api_key)):
     tool = tool_registry.get(request.tool)
     if tool is None:
         raise HTTPException(404, f"Unknown tool: {request.tool}")
     if tool.requires_confirmation:
+        # For safe_restart_service, build command dynamically from service name
+        if request.tool == "safe_restart_service":
+            if not request.service:
+                raise HTTPException(422, "Field 'service' is required for safe_restart_service")
+            commands = tool_registry.build_restart_command(request.service)
+            if commands is None:
+                raise HTTPException(
+                    403,
+                    f"Service '{request.service}' is not in the restart allowlist. "
+                    f"Allowed: {tool_registry.RESTARTABLE_SERVICES}",
+                )
+            target = _resolve_tool_target(request.target)
+            result = tool_executor.run_commands(commands, target=target)
+            metrics.record_tool_run(tool.name, result.exit_code)
+            metrics.record_request("/v1/tools/run", 200)
+            return ToolRunResponse(
+                tool=tool.name,
+                target=target.name,
+                exit_code=result.exit_code,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                truncated="...[truncated]" in result.stdout or "...[truncated]" in result.stderr,
+            )
         raise HTTPException(409, f"Tool requires explicit confirmation: {request.tool}")
 
     target = _resolve_tool_target(request.target)
     result = tool_executor.run_commands(tool.commands, target=target)
+    metrics.record_tool_run(tool.name, result.exit_code)
+    metrics.record_request("/v1/tools/run", 200)
     return ToolRunResponse(
         tool=tool.name,
         target=target.name,
@@ -433,7 +468,7 @@ async def run_tool(request: ToolRunRequest):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
+async def chat_completions(request: ChatCompletionRequest, _auth: None = Depends(require_api_key)):
     if router is None:
         raise HTTPException(503, "Server not ready")
 
@@ -459,8 +494,12 @@ async def chat_completions(request: ChatCompletionRequest):
     )
 
     if result.error and not result.text:
+        metrics.record_request("/v1/chat/completions", 503)
         raise HTTPException(503, detail=result.error)
 
+    metrics.record_request("/v1/chat/completions", 200)
+    metrics.record_inference(result.duration_sec)
+    metrics.record_rag_docs(persona_meta.get("rag_docs", 0))
     return _build_response(result, MODEL_ID, persona_meta=persona_meta)
 
 
@@ -470,20 +509,43 @@ async def _stream_chat(request: ChatCompletionRequest) -> AsyncGenerator[str, No
         yield "data: [DONE]\n\n"
         return
 
+    chat_id = f"chatcmpl-{int(time.time())}"
+    created = int(datetime.now().timestamp())
+
+    def _chunk(delta: dict, finish: str | None = None) -> str:
+        return f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': delta, 'finish_reason': finish}]})}\n\n"
+
+    # Check tool intent first (same logic as non-streaming)
+    tool_ctx = _maybe_run_tool_for_chat(request.messages)
+
+    if tool_ctx and tool_ctx["skip_llm"]:
+        # Direct tool output — yield as single content chunk
+        try:
+            yield _chunk({"role": "assistant"})
+            yield _chunk({"content": tool_ctx["response"]["choices"][0]["message"]["content"]})
+            yield _chunk({}, finish="stop")
+        except Exception as e:
+            logger.error("stream tool error: %s", e)
+        finally:
+            yield "data: [DONE]\n\n"
+        return
+
+    # Normal RAG-augmented inference
     messages, persona_meta = _augment_messages_with_rag(request.messages)
+    if tool_ctx:
+        messages.insert(0, tool_ctx["message"])
+        persona_meta.update(tool_ctx["meta"])
+
     result = router.run(
         messages=messages,
         max_tokens=request.max_tokens,
         temperature=request.temperature,
     )
 
-    chat_id = f"chatcmpl-{int(time.time())}"
-    created = int(datetime.now().timestamp())
-
     try:
-        yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
-        yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': {'content': result.text}, 'finish_reason': None}]})}\n\n"
-        yield f"data: {json.dumps({'id': chat_id, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+        yield _chunk({"role": "assistant"})
+        yield _chunk({"content": result.text})
+        yield _chunk({}, finish="stop")
     except Exception as e:
         logger.error("stream error: %s", e)
     finally:

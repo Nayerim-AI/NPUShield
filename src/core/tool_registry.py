@@ -22,6 +22,16 @@ class Tool:
 class ToolRegistry:
     """Registry of allowlisted tools with intent matching."""
 
+    # Services allowed to be restarted via safe_restart_service
+    RESTARTABLE_SERVICES: list[str] = [
+        "traefik",
+        "cloudflared",
+        "gitea",
+        "rabbitmq",
+        "dokploy",
+        "npushield",
+    ]
+
     def __init__(self, tools: list[Tool] | None = None):
         self._tools: dict[str, Tool] = {}
         for t in (tools or []):
@@ -29,6 +39,15 @@ class ToolRegistry:
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
+
+    def build_restart_command(self, service: str) -> list[str] | None:
+        """Build a safe restart command for an allowlisted service.
+
+        Returns None if the service is not in the allowlist.
+        """
+        if service not in self.RESTARTABLE_SERVICES:
+            return None
+        return [f"docker restart {service}"]
 
     def match_intent(self, text: str) -> Tool | None:
         """Match a natural language query to the best tool."""
