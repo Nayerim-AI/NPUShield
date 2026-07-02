@@ -1,0 +1,26 @@
+[Unit]
+Description=NPUShield RKLLM API Server
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=orangepi
+Group=orangepi
+WorkingDirectory=/home/orangepi/projects/npu/NPUShield
+ExecStart=/home/orangepi/projects/npu/NPUShield/.venv/bin/python -m src.api.server
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=npushield
+
+# Environment — set NPUSHIELD_RKLLM_MODEL to actual model path before enabling
+# EnvironmentFile=/etc/npushield/env
+Environment=NPUSHIELD_HOST=0.0.0.0
+Environment=NPUSHIELD_PORT=18999
+# Environment=NPUSHIELD_API_KEY=changeme
+# Environment=NPUSHIELD_RKLLM_MODEL=/home/orangepi/projects/npu/models/rkllm/...
+
+[Install]
+WantedBy=multi-user.target
