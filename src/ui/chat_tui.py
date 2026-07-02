@@ -177,18 +177,22 @@ def _cmd_help() -> str:
     {bold('Commands')}
 
       {cyan('Built-in:')}
-        /help, /h        — this message
-        /tools           — list available tools
-        /run <tool>      — execute tool directly
-        /model <name>    — switch model (default: rkllm-qwen2.5-1.5b)
-        /health          — check API health
-        /clear, /cls     — clear screen
-        /history         — show command history
-        /exit, /quit     — bye
+        /help, /h             — this message
+        /tools                — list available tools
+        /run <tool>           — execute tool directly
+          [service=<name>]    — for safe_restart_service
+          [target=local|gateway|backend]
+        /model <name>         — switch model (default: rkllm-qwen2.5-1.5b)
+        /health               — check API health
+        /clear, /cls          — clear chat panel
+        /clear-history, /ch   — reset conversation context
+        /history              — show input history
+        /exit, /quit          — bye
 
       {cyan('Anything else')}
-        — sent as chat query. If infra intent matches a tool,
-          tool runs directly (no LLM). Otherwise routes to RKLLM.
+        — sent as chat query with full conversation context (max 20 turns).
+          If infra intent matches a tool, tool runs directly (no LLM).
+          Otherwise routes to RKLLM.
 
     """).strip()
 
@@ -209,10 +213,22 @@ def _cmd_tools() -> str:
 
 def _cmd_run(args: list[str]) -> str:
     if not args:
-        return yellow("Usage: /run <tool_name> [target=local]")
+        return yellow("Usage: /run <tool_name> [service=<name>] [target=local|gateway|backend]")
     tool_name = args[0]
-    target = args[1] if len(args) > 1 else "local"
-    resp = _api_post("/v1/tools/run", {"tool": tool_name, "target": target})
+    target = "local"
+    service = None
+    for arg in args[1:]:
+        if arg.startswith("service="):
+            service = arg.split("=", 1)[1]
+        elif arg.startswith("target="):
+            target = arg.split("=", 1)[1]
+        else:
+            # positional: first extra arg = target (backward compat)
+            target = arg
+    body: dict = {"tool": tool_name, "target": target}
+    if service:
+        body["service"] = service
+    resp = _api_post("/v1/tools/run", body)
     if not resp:
         return red("❌ no response")
     return _display_tool_result(resp)
@@ -263,6 +279,12 @@ class NPUShieldDashboard:
         self.history_path = os.path.expanduser("~/.local/share/npushield/history.txt")
         os.makedirs(os.path.dirname(self.history_path), exist_ok=True)
         self._history = FileHistory(self.history_path)
+        # Multi-turn conversation context (max 20 turns = 40 messages)
+        self._conversation: list[dict] = []
+        self._MAX_TURNS = 20
+        # Streaming state: assistant reply being built
+        self._streaming_buf: str = ""
+        self._streaming: bool = False
 
     # ── formatting helpers for TUI panels ──
 
@@ -492,6 +514,9 @@ class NPUShieldDashboard:
                     self._append_chat(f"• current model: {self.model}")
             elif cmd in ("clear", "cls"):
                 self.chat_lines.clear()
+            elif cmd in ("clear-history", "ch"):
+                self._conversation.clear()
+                self._append_chat("• conversation history cleared")
             elif cmd == "history":
                 try:
                     content = open(self.history_path).read().strip()
@@ -508,9 +533,15 @@ class NPUShieldDashboard:
         self._do_chat(raw)
 
     def _do_chat(self, text: str) -> None:
+        # Add user message to conversation history
+        self._conversation.append({"role": "user", "content": text})
+        # Trim to max turns (keep system message if present)
+        while len(self._conversation) > self._MAX_TURNS * 2:
+            self._conversation.pop(0)
+
         body = {
             "model": self.model,
-            "messages": [{"role": "user", "content": text}],
+            "messages": self._conversation,
             "max_tokens": 480,
             "stream": True,
         }
@@ -520,48 +551,73 @@ class NPUShieldDashboard:
         if API_KEY:
             headers["X-API-Key"] = API_KEY
         req = Request(url, data=data, headers=headers, method="POST")
-        try:
-            with urlopen(req, timeout=180) as resp:
-                # Stream: read all and parse SSE
-                raw = resp.read().decode()
-                content_parts = []
-                for line in raw.split("\n"):
-                    line = line.strip()
-                    if not line.startswith("data: "):
-                        continue
-                    payload = line[6:]
-                    if payload == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(payload)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        c = delta.get("content")
-                        if c:
-                            content_parts.append(c)
-                        # extract token rate if available
-                        tps = chunk.get("x-tokens-per-sec")
-                        if tps is not None:
-                            self.token_rate_history.append(float(tps))
-                            if len(self.token_rate_history) > 20:
-                                self.token_rate_history = self.token_rate_history[-20:]
-                    except (json.JSONDecodeError, IndexError, KeyError):
-                        pass
-                if content_parts:
-                    self._append_chat("◄ " + "".join(content_parts))
-                else:
-                    # Try non-streaming parse fallback
-                    try:
-                        o = json.loads(raw)
-                        self._append_chat(_display_response(o))
-                    except Exception:
-                        self._append_chat("◄ (empty response)")
+
+        # Start streaming placeholder
+        self._streaming = True
+        self._streaming_buf = ""
+        self.chat_lines.append("◄ ")  # placeholder line, updated in-place
+        placeholder_idx = len(self.chat_lines) - 1
+
+        def _stream():
+            try:
+                with urlopen(req, timeout=180) as resp:
+                    buf = b""
+                    while True:
+                        chunk = resp.read(64)
+                        if not chunk:
+                            break
+                        buf += chunk
+                        while b"\n" in buf:
+                            line_bytes, buf = buf.split(b"\n", 1)
+                            line = line_bytes.decode(errors="replace").strip()
+                            if not line.startswith("data: "):
+                                continue
+                            payload = line[6:]
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                obj = json.loads(payload)
+                                delta = obj.get("choices", [{}])[0].get("delta", {})
+                                c = delta.get("content")
+                                if c:
+                                    self._streaming_buf += c
+                                    self.chat_lines[placeholder_idx] = "◄ " + self._streaming_buf
+                                    try:
+                                        self._app.invalidate()
+                                    except Exception:
+                                        pass
+                                tps = obj.get("x-tokens-per-sec")
+                                if tps is not None:
+                                    self.token_rate_history.append(float(tps))
+                                    if len(self.token_rate_history) > 20:
+                                        self.token_rate_history = self.token_rate_history[-20:]
+                            except (json.JSONDecodeError, IndexError, KeyError):
+                                pass
+
+                # Finalize
+                if not self._streaming_buf:
+                    self.chat_lines[placeholder_idx] = "◄ (empty response)"
+                # Add assistant reply to conversation history
+                self._conversation.append({"role": "assistant", "content": self._streaming_buf})
                 self._append_log("chat response received")
-        except URLError as e:
-            self._append_chat(red(f"❌ {e}"))
-            self._append_log(f"error: {e}")
-        except Exception as e:
-            self._append_chat(red(f"❌ {e}"))
-            self._append_log(f"error: {e}")
+
+            except URLError as e:
+                self.chat_lines[placeholder_idx] = red(f"❌ {e}")
+                self._append_log(f"error: {e}")
+                # Remove failed user message from history
+                if self._conversation and self._conversation[-1]["role"] == "user":
+                    self._conversation.pop()
+            except Exception as e:
+                self.chat_lines[placeholder_idx] = red(f"❌ {e}")
+                self._append_log(f"error: {e}")
+                if self._conversation and self._conversation[-1]["role"] == "user":
+                    self._conversation.pop()
+            finally:
+                self._streaming = False
+
+        # Run in background thread so TUI stays responsive
+        t = threading.Thread(target=_stream, daemon=True)
+        t.start()
 
     # ── background polling ──
 
@@ -687,6 +743,7 @@ class NPUShieldDashboard:
             full_screen=True,
             mouse_support=True,
         )
+        self._app: Application = app
 
         # Start background polling thread
         poll_thread = threading.Thread(
