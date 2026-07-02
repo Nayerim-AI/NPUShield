@@ -267,6 +267,16 @@ app = FastAPI(
 )
 
 
+@app.middleware("http")
+async def inflight_middleware(request: Request, call_next):
+    """Track inflight requests for graceful shutdown monitoring."""
+    metrics.inc_inflight()
+    try:
+        return await call_next(request)
+    finally:
+        metrics.dec_inflight()
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────
 
 @app.get("/metrics")
@@ -639,4 +649,9 @@ def _build_response(result: InferenceResult, model_id: str, persona_meta: dict |
 
 if __name__ == "__main__":
     logger.info("NPUShield starting on %s:%s", HOST, PORT)
-    uvicorn.run(app, host=HOST, port=PORT)
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        timeout_graceful_shutdown=30,
+    )

@@ -29,6 +29,7 @@ class MetricsCollector:
         self._inference_duration_sum: float = 0.0
         self._inference_duration_count: int = 0
         self._start_time: float = time.time()
+        self._inflight: int = 0
 
     def record_request(self, endpoint: str, status: int) -> None:
         with self._lock:
@@ -46,6 +47,14 @@ class MetricsCollector:
     def record_rag_docs(self, count: int) -> None:
         with self._lock:
             self._rag_docs_total += count
+
+    def inc_inflight(self) -> None:
+        with self._lock:
+            self._inflight += 1
+
+    def dec_inflight(self) -> None:
+        with self._lock:
+            self._inflight = max(0, self._inflight - 1)
 
     def render_prometheus(self) -> str:
         """Render all metrics in Prometheus text exposition format."""
@@ -86,6 +95,11 @@ class MetricsCollector:
             lines.append("# HELP npushield_rag_docs_retrieved_total Total RAG docs retrieved")
             lines.append("# TYPE npushield_rag_docs_retrieved_total counter")
             lines.append(f"npushield_rag_docs_retrieved_total {self._rag_docs_total}")
+
+            # inflight
+            lines.append("# HELP npushield_inflight_requests Current inflight requests")
+            lines.append("# TYPE npushield_inflight_requests gauge")
+            lines.append(f"npushield_inflight_requests {self._inflight}")
 
         return "\n".join(lines) + "\n"
 
